@@ -1,6 +1,7 @@
 """Cross-call authentication behavior; no third-party requests."""
 
 import asyncio
+import json
 import os
 import sys
 from pathlib import Path
@@ -243,3 +244,149 @@ asyncio.run(run())
 
     await asyncio.gather(*(child() for _ in range(3)))
     assert counter.read_text().splitlines() == ["login"]
+
+
+@pytest.fixture
+def rotating_domains(monkeypatch, tmp_path):
+    from zlibrary import eapi
+
+    monkeypatch.setenv("ZLIBRARY_SESSION_DIR", str(tmp_path / "sessions"))
+    monkeypatch.setenv("ZLIBRARY_EMAIL", "reader@example.test")
+    monkeypatch.setenv("ZLIBRARY_PASSWORD", "offline-domain-recovery-credential")
+    monkeypatch.delenv("ZLIBRARY_ACCOUNT_CREDENTIALS", raising=False)
+    monkeypatch.delenv("ZLIBRARY_EAPI_DOMAIN", raising=False)
+    monkeypatch.setattr(
+        eapi, "DEFAULT_EAPI_DOMAINS", ["a.example.test", "b.example.test"]
+    )
+    state = {
+        "failure": None,
+        "b_failure": None,
+        "b_profile_failure": None,
+        "logins": 0,
+        "profiles": [],
+        "clients": [],
+    }
+
+    def handle(request):
+        domain = request.url.host
+        failure = state["failure"] if domain == "a.example.test" else state["b_failure"]
+        if request.url.path == "/eapi/user/profile":
+            state["profiles"].append(domain)
+            assert "remix_userkey=offline-cookie" in request.headers["cookie"]
+            if domain == "b.example.test":
+                failure = state["b_profile_failure"] or failure
+        if failure == "network":
+            raise httpx.ConnectError("domain unavailable", request=request)
+        if failure == "wall":
+            return httpx.Response(513, text="DiamWall")
+        if failure == "upstream":
+            return httpx.Response(503, text="Unavailable")
+        if request.url.path == "/eapi/info/domains":
+            return httpx.Response(200, json={"domains": []})
+        if request.url.path == "/eapi/user/login":
+            state["logins"] += 1
+            return httpx.Response(
+                200,
+                json={
+                    "success": 1,
+                    "user": {"id": 123, "remix_userkey": "offline-cookie"},
+                },
+            )
+        assert request.url.path == "/eapi/user/profile"
+        if failure == "expired":
+            return httpx.Response(401, json={"error": "Please login"})
+        return httpx.Response(200, json={"success": 1, "user": {"id": 123}})
+
+    transport = httpx.MockTransport(handle)
+
+    async def get_client(self):
+        if self._client is None or self._client.is_closed:
+            self._client = httpx.AsyncClient(transport=transport, cookies=self._cookies)
+            state["clients"].append(self._client)
+        return self._client
+
+    async def resolve():
+        return await eapi.resolve_eapi_domain(transport=transport)
+
+    monkeypatch.setattr(EAPIClient, "_get_client", get_client)
+    monkeypatch.setattr(python_bridge, "resolve_eapi_domain", resolve)
+    monkeypatch.setattr(python_bridge, "_eapi_client", None)
+    return state
+
+
+@pytest.mark.parametrize("failure", ["network", "wall", "upstream"])
+async def test_cached_session_recovers_domain_without_login(rotating_domains, failure):
+    await call_and_close()
+    rotating_domains["failure"] = failure
+    await call_and_close()
+    await call_and_close()
+    assert rotating_domains["logins"] == 1
+    assert rotating_domains["profiles"] == [
+        "a.example.test",
+        "b.example.test",
+        "b.example.test",
+    ]
+    record = json.loads(
+        next(Path(os.environ["ZLIBRARY_SESSION_DIR"]).glob("*.json")).read_text()
+    )
+    assert record["domain"] == "b.example.test"
+    assert all(client.is_closed for client in rotating_domains["clients"])
+
+
+@pytest.mark.parametrize("failure", ["network", "wall"])
+async def test_pinned_cached_domain_does_not_switch(
+    rotating_domains, monkeypatch, failure
+):
+    from zlibrary.eapi import DiamWallError
+
+    monkeypatch.setenv("ZLIBRARY_EAPI_DOMAIN", "a.example.test")
+    await call_and_close()
+    rotating_domains["failure"] = failure
+    with pytest.raises((httpx.ConnectError, DiamWallError)):
+        await call_and_close()
+    assert rotating_domains["logins"] == 1
+    assert rotating_domains["profiles"] == ["a.example.test"]
+    assert all(client.is_closed for client in rotating_domains["clients"])
+
+
+async def test_failed_domain_recovery_retains_cookies_without_login(rotating_domains):
+    await call_and_close()
+    path = next(Path(os.environ["ZLIBRARY_SESSION_DIR"]).glob("*.json"))
+    original = path.read_bytes()
+    rotating_domains["failure"] = "network"
+    rotating_domains["b_failure"] = "network"
+    with pytest.raises(httpx.ConnectError):
+        await call_and_close()
+    assert path.read_bytes() == original
+    assert rotating_domains["logins"] == 1
+    assert all(client.is_closed for client in rotating_domains["clients"])
+    rotating_domains["b_failure"] = None
+    await call_and_close()
+    assert rotating_domains["logins"] == 1
+
+
+async def test_expired_cookies_on_recovered_domain_allow_login(rotating_domains):
+    await call_and_close()
+    rotating_domains["failure"] = "network"
+    rotating_domains["b_failure"] = "expired"
+    await call_and_close()
+    assert rotating_domains["logins"] == 2
+    assert rotating_domains["profiles"] == ["a.example.test", "b.example.test"]
+    assert all(client.is_closed for client in rotating_domains["clients"])
+
+
+@pytest.mark.parametrize("failure", ["network", "wall", "upstream"])
+async def test_recovered_domain_profile_failure_keeps_cache(rotating_domains, failure):
+    from zlibrary.eapi import DiamWallError
+
+    await call_and_close()
+    path = next(Path(os.environ["ZLIBRARY_SESSION_DIR"]).glob("*.json"))
+    original = path.read_bytes()
+    rotating_domains["failure"] = "network"
+    rotating_domains["b_profile_failure"] = failure
+    with pytest.raises((httpx.ConnectError, httpx.HTTPStatusError, DiamWallError)):
+        await call_and_close()
+    assert rotating_domains["profiles"] == ["a.example.test", "b.example.test"]
+    assert rotating_domains["logins"] == 1
+    assert path.read_bytes() == original
+    assert all(client.is_closed for client in rotating_domains["clients"])

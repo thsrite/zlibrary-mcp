@@ -277,6 +277,7 @@ async def _initialize_account(account) -> EAPIClient:
         account.password,
         lambda: _login_eapi_client(account.email, account.password),
         EAPIClient,
+        resolve_eapi_domain,
     )
     return _eapi_client
 

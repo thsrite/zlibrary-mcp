@@ -14,6 +14,7 @@ import tempfile
 import time
 
 import httpx
+from zlibrary.eapi import DiamWallError
 
 if os.name == "nt":
     import msvcrt
@@ -146,7 +147,9 @@ async def _is_authenticated(client) -> bool:
     )
 
 
-async def authenticated_client(email: str, password: str, login, client_factory):
+async def authenticated_client(
+    email: str, password: str, login, client_factory, resolve_domain
+):
     """Validate shared cookies, or serialize a single login and atomic save."""
     root = _private_directory()
     account = hashlib.sha256(email.encode()).hexdigest()
@@ -173,7 +176,25 @@ async def authenticated_client(email: str, password: str, login, client_factory)
                 remix_userkey=record["userkey"],
             )
             try:
-                valid = await _is_authenticated(client)
+                try:
+                    valid = await _is_authenticated(client)
+                except (httpx.RequestError, httpx.HTTPStatusError, DiamWallError):
+                    await client.close()
+                    if os.environ.get("ZLIBRARY_EAPI_DOMAIN", "").strip():
+                        raise
+                    domain = await resolve_domain()
+                    if domain == record["domain"]:
+                        raise
+                    client = client_factory(
+                        domain,
+                        remix_userid=record["userid"],
+                        remix_userkey=record["userkey"],
+                    )
+                    # Only explicit authentication rejection permits a login.
+                    # A failed recovery leaves the shared cookies unchanged.
+                    valid = await _is_authenticated(client)
+                    if valid:
+                        _write(path, {**record, "domain": client.domain})
             except BaseException:
                 await client.close()
                 raise

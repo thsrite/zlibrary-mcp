@@ -10,6 +10,7 @@ Persist only EAPI session cookies in a private directory outside download artifa
 
 - Sequential and concurrent bridge processes using the same credentials perform one successful login and reuse its cookies.
 - Validate cached cookies with `/eapi/user/profile`; only an explicit authentication rejection causes one fresh login. Network errors, walls, and unrelated business errors must not cause logins.
+- If a cached domain becomes unreachable or walled and no domain is explicitly pinned, rediscover a working domain and validate the existing cookies there. Save the new domain only after successful validation; failed recovery preserves the cache and never triggers login. Cover A-to-B recovery, explicit pins, unavailable candidates, and profile failures on the replacement domain with offline transport tests.
 - Credential or explicit-domain changes cannot reuse a previous session.
 - The session directory and files are private; writes are atomic; credentials and cookies never appear in diagnostics.
 - An upstream login-limit rejection is readable, and a short local cooldown prevents subsequent calls from immediately repeating it. This cooldown is not an estimate of upstream recovery time.
